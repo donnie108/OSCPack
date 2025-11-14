@@ -1,0 +1,5 @@
+pypdf
+Pillow
+docx2pdf
+reportlab
+beautifulsoup4
