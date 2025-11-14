@@ -36,7 +36,7 @@ except ImportError:
 # ======================================================
 # Application Version (used by build.sh and GUI updater)
 # ======================================================
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # ========== CONFIG (overridden by run_pipeline) ==========
 

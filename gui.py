@@ -1,20 +1,27 @@
+import os
+import sys
+import json
+import ssl
+import zipfile
+import threading
+from pathlib import Path
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading
-import os
 
-# Import your pipeline
+# Import your pipeline + version
 try:
-    from core import run_pipeline
+    from core import run_pipeline, APP_VERSION
 except ImportError:
     run_pipeline = None
+    APP_VERSION = "dev"
 
 
 class BatesGUI(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Bates Labeling & Conversion Tool")
+        self.title(f"OSCPack {APP_VERSION}")
         self.geometry("980x650")
 
         container = ttk.Frame(self, padding=10)
@@ -133,6 +140,9 @@ class BatesGUI(tk.Tk):
         self.run_button = ttk.Button(buttons, text="Run", command=self.on_run_clicked)
         self.run_button.pack(side="left")
 
+        self.update_button = ttk.Button(buttons, text="Check for updates", command=self.check_for_updates)
+        self.update_button.pack(side="left", padx=(8, 0))
+
         ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
 
         # ===== Log / Output =====
@@ -175,11 +185,14 @@ class BatesGUI(tk.Tk):
     def set_running_state(self, running: bool):
         if running:
             self.run_button.configure(text="Running...", state="disabled")
+            self.update_button.configure(state="disabled")
         else:
             self.run_button.configure(text="Run", state="normal")
+            self.update_button.configure(state="normal")
 
     def on_dry_run_toggle(self):
-        # In dry run, backups are harmless but also not necessary; we leave it as user choice.
+        # Backups in dry-run are harmless but optional;
+        # we leave the toggle alone for now.
         pass
 
     def on_rename_folders_toggle(self):
@@ -194,7 +207,7 @@ class BatesGUI(tk.Tk):
           - keep_name_var
           - folder renaming
           - combined final PDF
-        So we visually gray them out when it's enabled.
+        So we visually gray out related controls.
         """
         conv_only = self.conversion_only_var.get()
         controls = [
@@ -210,7 +223,7 @@ class BatesGUI(tk.Tk):
             if self.rename_folders_var.get():
                 self.keep_folder_name_cb.state(["!disabled"])
 
-    # ===== Main actions =====
+    # ===== Main pipeline actions =====
 
     def on_run_clicked(self):
         if run_pipeline is None:
@@ -232,7 +245,6 @@ class BatesGUI(tk.Tk):
         combine_final = self.combine_final_var.get()
         conversion_only = self.conversion_only_var.get()
 
-        # Validate inputs
         if not root or not os.path.isdir(root):
             messagebox.showerror("Invalid folder", "Please select a valid root folder.")
             return
@@ -251,7 +263,6 @@ class BatesGUI(tk.Tk):
             )
             return
 
-        # If conversion-only, some toggles are irrelevant
         if conversion_only and combine_final:
             messagebox.showinfo(
                 "Note",
@@ -259,6 +270,7 @@ class BatesGUI(tk.Tk):
             )
 
         self.clear_log()
+        self.log(f"OSCPack {APP_VERSION}")
         self.log(f"Root: {root}")
         self.log(f"Prefix: {prefix}")
         self.log(f"Digits: {digits}, Starting #: {start}")
@@ -278,7 +290,6 @@ class BatesGUI(tk.Tk):
 
         self.set_running_state(True)
 
-        # Run pipeline in a background thread so GUI stays responsive
         thread = threading.Thread(
             target=self.run_pipeline_thread,
             args=(
@@ -380,6 +391,107 @@ class BatesGUI(tk.Tk):
         self.log(f"\nError: {e}")
         messagebox.showerror("Error", str(e))
         self.set_running_state(False)
+
+    # ===== Update system (GitHub Releases) =====
+
+    def version_tuple(self, v: str):
+        return tuple(int(p) for p in v.split(".") if p.isdigit())
+
+    def check_for_updates(self):
+        """
+        Check GitHub Releases for a newer version and, if available,
+        download the zip next to the current OSCPack.app.
+        """
+        owner = "donnie108"
+        repo = "OSCPack"
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+
+        self.log("Checking for updates...")
+        try:
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(api_url, context=ctx, timeout=8) as resp:
+                data = json.load(resp)
+        except Exception as e:
+            messagebox.showerror("Update check failed", f"Could not contact update server:\n{e}")
+            self.log(f"Update check failed: {e}")
+            return
+
+        tag = data.get("tag_name", "")
+        assets = data.get("assets", [])
+        if not tag or not assets:
+            messagebox.showerror("Update check failed", "Invalid response from update server.")
+            self.log("Update check failed: no tag/assets in response.")
+            return
+
+        latest_version = tag.lstrip("v")
+        download_url = assets[0].get("browser_download_url")
+
+        self.log(f"Current version: {APP_VERSION}")
+        self.log(f"Latest version on GitHub: {latest_version}")
+
+        if self.version_tuple(latest_version) <= self.version_tuple(APP_VERSION):
+            messagebox.showinfo("Up to date", f"You are running the latest version ({APP_VERSION}).")
+            return
+
+        if not download_url:
+            messagebox.showerror("Update", "No downloadable asset found for the latest release.")
+            return
+
+        if not messagebox.askyesno(
+            "Update available",
+            f"A new version {latest_version} is available (you are on {APP_VERSION}).\n\n"
+            "Download it now?"
+        ):
+            return
+
+        thread = threading.Thread(
+            target=self.download_update_thread,
+            args=(download_url, latest_version),
+            daemon=True,
+        )
+        thread.start()
+
+    def download_update_thread(self, url: str, latest_version: str):
+        try:
+            self.after(0, lambda: self.log(f"Downloading OSCPack {latest_version}..."))
+
+            here = Path(sys.argv[0]).resolve()
+            app_root = here
+            # For a bundled .app, sys.argv[0] is .../OSCPack.app/Contents/MacOS/OSCPack
+            # Step up three times to get to .../OSCPack.app
+            for _ in range(3):
+                app_root = app_root.parent
+            target_dir = app_root.parent  # folder containing OSCPack.app
+
+            target_dir.mkdir(parents=True, exist_ok=True)
+            zip_name = f"OSCPack-macOS-{latest_version}.zip"
+            zip_path = target_dir / zip_name
+
+            self.after(0, lambda: self.log(f"Saving update to: {zip_path}"))
+
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(url, context=ctx, timeout=60) as resp, open(zip_path, "wb") as f:
+                f.write(resp.read())
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(target_dir)
+
+            self.after(0, lambda: self.log(f"Update downloaded and extracted in {target_dir}"))
+
+            self.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Update downloaded",
+                    "The new version has been downloaded next to your current OSCPack.app.\n\n"
+                    "To finish updating:\n"
+                    "1. Quit this app.\n"
+                    "2. In Finder, replace the old OSCPack.app with the new one.\n"
+                    "3. Launch OSCPack again."
+                ),
+            )
+        except Exception as e:
+            self.after(0, lambda: self.log(f"Update download failed: {e}"))
+            self.after(0, lambda: messagebox.showerror("Update failed", str(e)))
 
 
 def main():
